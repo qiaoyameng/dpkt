@@ -58,6 +58,7 @@ from . import rip
 from . import rpc
 from . import rtcp
 from . import rtp
+from . import rtpstat
 from . import rx
 from . import sccp
 from . import sctp
