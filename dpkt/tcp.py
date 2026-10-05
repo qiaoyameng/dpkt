@@ -123,6 +123,7 @@ TCP_OPT_SKEETER = 16  # Skeeter
 TCP_OPT_BUBBA = 17  # Bubba
 TCP_OPT_TRAILSUM = 18  # trailer checksum
 TCP_OPT_MD5 = 19  # MD5 signature, RFC 2385
+TCP_OPT_AO = 29  # TCP Authentication Option, RFC 5925
 TCP_OPT_SCPS = 20  # SCPS capabilities
 TCP_OPT_SNACK = 21  # selective negative acks
 TCP_OPT_REC = 22  # record boundaries
