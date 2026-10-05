@@ -223,6 +223,14 @@ dpkt.ip6 module
     :undoc-members:
     :show-inheritance:
 
+dpkt.ipfix module
+-----------------
+
+.. automodule:: dpkt.ipfix
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.ipx module
 ---------------
 
