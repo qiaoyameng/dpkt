@@ -4,6 +4,8 @@
 from __future__ import print_function
 from __future__ import absolute_import
 
+from collections import namedtuple
+
 from . import dpkt
 from .compat import iteritems
 from .utils import inet_to_str, deprecation_warning
@@ -144,6 +146,278 @@ class IP(dpkt.Packet):
     def off(self, val):
         deprecation_warning("IP.off is deprecated")
         self.offset = val
+
+
+IP_REASSEMBLY_TIMEOUT = 30
+
+
+class IPReassemblyError(dpkt.Error):
+    """A fragment cannot be reassembled and its group was discarded."""
+
+
+DroppedDatagram = namedtuple('DroppedDatagram', ['key', 'reason', 'timestamp', 'buffered_bytes'])
+
+
+class _FragmentGroup(object):
+    def __init__(self, key):
+        self.key = key
+        self.fragments = []
+        self.first_header = None
+        self.total_len = None
+        self.first_seen = None
+        self.last_seen = None
+
+    @property
+    def buffered_bytes(self):
+        total = sum(len(chunk) for start, chunk in self.fragments)
+        if self.first_header is not None:
+            total += len(self.first_header)
+        return total
+
+    @staticmethod
+    def merged(fragments):
+        ordered = sorted(((start, bytearray(chunk)) for start, chunk in fragments if chunk),
+                         key=lambda fragment: fragment[0])
+        merged = []
+        for start, chunk in ordered:
+            end = start + len(chunk)
+            if not merged or start > merged[-1][0] + len(merged[-1][1]):
+                merged.append([start, chunk])
+                continue
+
+            previous_start, previous_chunk = merged[-1]
+            previous_end = previous_start + len(previous_chunk)
+            if start < previous_end:
+                overlap_len = min(end, previous_end) - start
+                if bytes(previous_chunk[start - previous_start:start - previous_start + overlap_len]) != \
+                        bytes(chunk[:overlap_len]):
+                    return None
+            if end > previous_end:
+                previous_chunk.extend(chunk[previous_end - start:])
+
+            for index in range(len(merged) - 2, -1, -1):
+                earlier_start, earlier_chunk = merged[index]
+                earlier_end = earlier_start + len(earlier_chunk)
+                current_start, current_chunk = merged[index + 1]
+                if current_start > earlier_end:
+                    break
+
+                overlap_len = min(earlier_end, current_start + len(current_chunk)) - current_start
+                if bytes(earlier_chunk[current_start - earlier_start:current_start - earlier_start + overlap_len]) != \
+                        bytes(current_chunk[:overlap_len]):
+                    return None
+
+                if current_start + len(current_chunk) > earlier_end:
+                    earlier_chunk.extend(current_chunk[overlap_len:])
+                merged.pop(index + 1)
+
+        return [(start, bytes(chunk)) for start, chunk in merged]
+
+    def payload(self):
+        if not self.fragments or self.fragments[0][0] != 0 or self.total_len is None:
+            return None
+
+        payload = bytearray()
+        for start, chunk in self.fragments:
+            if start != len(payload):
+                return None
+            payload.extend(chunk)
+
+        if len(payload) != self.total_len:
+            return None
+        return bytes(payload)
+
+
+class IPReassembler(object):
+    """Reassemble IPv4 fragments without using a background timer.
+
+    Groups are keyed by source address, destination address, protocol and
+    identification.  Callers supply a timestamp with every fragment and call
+    :meth:`expire` to discard incomplete groups once they are too old.
+    """
+
+    def __init__(self, timeout=IP_REASSEMBLY_TIMEOUT, max_groups=1024, max_buffered_bytes=1024 * 1024):
+        if timeout is not None and timeout < 0:
+            raise ValueError('timeout must be non-negative or None')
+        if max_groups is not None and max_groups < 0:
+            raise ValueError('max_groups must be non-negative or None')
+        if max_buffered_bytes is not None and max_buffered_bytes < 0:
+            raise ValueError('max_buffered_bytes must be non-negative or None')
+
+        self.timeout = timeout
+        self.max_groups = max_groups
+        self.max_buffered_bytes = max_buffered_bytes
+        self.groups = {}
+        self.dropped = []
+
+    @property
+    def group_count(self):
+        return len(self.groups)
+
+    @property
+    def buffered_bytes(self):
+        return sum(group.buffered_bytes for group in self.groups.values())
+
+    def __len__(self):
+        return len(self.groups)
+
+    def push(self, packet, timestamp):
+        """Add a fragment and return the complete IP datagram, or ``None``."""
+        if not isinstance(packet, IP):
+            packet = IP(packet)
+
+        self.expire(timestamp)
+
+        key = (packet.src, packet.dst, packet.p, packet.id)
+        if packet.mf == 0 and packet.offset == 0:
+            return packet
+
+        try:
+            start, payload, header_len = self._fragment_info(packet)
+        except IPReassemblyError:
+            self._drop_existing(key, 'invalid_packet', timestamp)
+            raise
+        except Exception:
+            self._drop_existing(key, 'invalid_packet', timestamp)
+            raise IPReassemblyError('invalid IPv4 fragment')
+
+        if start % 8:
+            self._drop_existing(key, 'invalid_packet', timestamp)
+            raise IPReassemblyError('fragment offset is not 8-byte aligned')
+        if packet.mf == 1 and len(payload) % 8:
+            self._drop_existing(key, 'invalid_packet', timestamp)
+            raise IPReassemblyError('non-final fragment payload is not 8-byte aligned')
+
+        end = start + len(payload)
+        group = self.groups.get(key)
+        is_new_group = group is None
+        if is_new_group:
+            if self.max_groups is not None and len(self.groups) >= self.max_groups:
+                dropped = self._make_drop(key, 'max_groups', timestamp, 0)
+                self.dropped.append(dropped)
+                raise IPReassemblyError('maximum reassembly group count exceeded')
+            group = _FragmentGroup(key)
+            group.first_seen = timestamp
+            group.last_seen = timestamp
+            self.groups[key] = group
+
+        if group.total_len is not None and end > group.total_len:
+            return self._reject(group, 'fragment_past_end', timestamp)
+
+        first_header = group.first_header
+        if start == 0 and first_header is None:
+            first_header = packet.pack_hdr() + packet.opts
+            if group.total_len is not None and group.total_len > IP_LEN_MAX - len(first_header):
+                return self._reject(group, 'datagram_too_large', timestamp)
+
+        candidate = list(group.fragments)
+        if payload:
+            candidate.append((start, bytes(payload)))
+        merged = _FragmentGroup.merged(candidate)
+        if merged is None:
+            return self._reject(group, 'overlap_conflict', timestamp)
+
+        projected_payload = sum(len(chunk) for fragment_start, chunk in merged)
+        projected = projected_payload
+        if first_header is not None:
+            projected += len(first_header)
+        projected += self.buffered_bytes - group.buffered_bytes
+        if self.max_buffered_bytes is not None and projected > self.max_buffered_bytes:
+            return self._reject(group, 'max_buffered_bytes', timestamp)
+
+        if packet.mf == 0:
+            complete_header_len = len(first_header) if first_header is not None else header_len
+            if end > IP_LEN_MAX - complete_header_len:
+                return self._reject(group, 'datagram_too_large', timestamp)
+            if group.total_len is not None and end != group.total_len:
+                return self._reject(group, 'inconsistent_total_length', timestamp)
+            if any(start + len(chunk) > end for start, chunk in group.fragments):
+                return self._reject(group, 'fragment_past_end', timestamp)
+            group.total_len = end
+
+        group.fragments = merged
+        if first_header is not None:
+            group.first_header = first_header
+        group.last_seen = timestamp
+
+        payload = group.payload()
+        if payload is None:
+            return None
+
+        return self._complete(group, payload)
+
+    add = push
+    process = push
+    reassemble = push
+
+    def expire(self, timestamp):
+        """Expire incomplete groups and return newly recorded drops."""
+        if self.timeout is None:
+            return []
+
+        expired = []
+        for key in list(self.groups):
+            group = self.groups[key]
+            if timestamp - group.first_seen >= self.timeout:
+                expired.append(self._make_drop(key, 'timeout', timestamp, group.buffered_bytes))
+                del self.groups[key]
+        self.dropped.extend(expired)
+        return expired
+
+    advance = expire
+    flush_expired = expire
+
+    @staticmethod
+    def _fragment_info(packet):
+        if packet.v != 4:
+            raise IPReassemblyError('not an IPv4 packet')
+
+        header_len = packet.__hdr_len__ + len(packet.opts)
+        if packet.hl < 5 or header_len > IP_HDR_LEN_MAX or header_len != packet.hl * 4:
+            raise IPReassemblyError('invalid IPv4 header length')
+
+        if packet.len:
+            if packet.len < header_len or packet.len > IP_LEN_MAX:
+                raise IPReassemblyError('invalid IPv4 total length')
+            payload_len = packet.len - header_len
+            if len(packet.data) != payload_len:
+                raise IPReassemblyError('truncated IPv4 fragment')
+        else:
+            payload_len = len(packet.data)
+
+        start = packet.offset * 8
+        if start > IP_LEN_MAX - header_len or start + payload_len > IP_LEN_MAX - header_len:
+            raise IPReassemblyError('fragment payload exceeds IPv4 datagram bounds')
+
+        return start, bytes(packet.data), header_len
+
+    def _complete(self, group, payload):
+        header = bytearray(group.first_header)
+        header[0] = 0x40 | ((len(header) // 4) & 0x0f)
+        total_len = len(header) + len(payload)
+        header[2:4] = bytearray(((total_len >> 8) & 0xff, total_len & 0xff))
+        header[6:8] = b'\x00\x00'
+        header[10:12] = b'\x00\x00'
+        checksum = dpkt.in_cksum(bytes(header))
+        header[10:12] = bytearray(((checksum >> 8) & 0xff, checksum & 0xff))
+        del self.groups[group.key]
+        return IP(bytes(header) + payload)
+
+    def _reject(self, group, reason, timestamp):
+        dropped = self._make_drop(group.key, reason, timestamp, group.buffered_bytes)
+        self.groups.pop(group.key, None)
+        self.dropped.append(dropped)
+        raise IPReassemblyError(reason)
+
+    def _drop_existing(self, key, reason, timestamp):
+        group = self.groups.pop(key, None)
+        buffered_bytes = group.buffered_bytes if group is not None else 0
+        if group is not None:
+            self.dropped.append(self._make_drop(key, reason, timestamp, buffered_bytes))
+
+    @staticmethod
+    def _make_drop(key, reason, timestamp, buffered_bytes):
+        return DroppedDatagram(key, reason, timestamp, buffered_bytes)
 
 
 # IP Headers
@@ -502,3 +776,182 @@ def test_default_udp_checksum():
 def test_get_proto_name():
     assert get_ip_proto_name(6) == 'TCP'
     assert get_ip_proto_name(999) is None
+
+
+def _test_fragment(payload_chunks, ident=0x1234, opts=b'', p=17):
+    header_len = IP_HDR_LEN + len(opts)
+    fragments = []
+    offset = 0
+
+    for index, chunk in enumerate(payload_chunks):
+        is_last = index == len(payload_chunks) - 1
+        fragment = IP(id=ident, src=b'\x0a\x00\x00\x01', dst=b'\x0a\x00\x00\x02',
+                      p=p, opts=opts, data=chunk, offset=offset // 8, mf=0 if is_last else 1)
+        fragment.hl = header_len // 4
+        fragments.append(bytes(fragment))
+        offset += len(chunk)
+
+    return fragments
+
+
+def _test_payload():
+    return b'\x04\xd2\x00\x35\x00\x1c\x00\x00' + bytes(bytearray(range(20)))
+
+
+def test_ip_reassembly_out_of_order_duplicate():
+    import pytest
+    from . import udp
+
+    fragments = _test_fragment([_test_payload()[i:i + 8] for i in range(0, 28, 8)])
+    reassembler = IPReassembler(timeout=10)
+
+    assert isinstance(IP(fragments[1]).data, bytes)
+    assert reassembler.push(fragments[3], 1) is None
+    assert reassembler.push(fragments[0], 2) is None
+    assert reassembler.push(fragments[3], 3) is None
+    assert reassembler.push(fragments[1], 4) is None
+    assert reassembler.dropped == []
+
+    datagram = reassembler.push(fragments[2], 5)
+    assert isinstance(datagram, IP)
+    assert datagram.offset == 0
+    assert datagram.mf == 0
+    assert datagram.df == 0
+    assert datagram.len == IP_HDR_LEN + 28
+    assert bytes(datagram.data) == _test_payload()
+    assert dpkt.in_cksum(datagram.pack_hdr()) == 0
+
+    reparsed = IP(bytes(datagram))
+    assert isinstance(reparsed.data, udp.UDP)
+    assert reparsed.udp.data == bytes(bytearray(range(20)))
+    assert reassembler.group_count == 0
+    assert reassembler.buffered_bytes == 0
+
+
+def test_ip_reassembly_preserves_first_fragment_options():
+    opts = b'\x01\x01\x01\x00'
+    payload = bytes(bytearray(range(20)))
+    fragments = _test_fragment([payload[:8], payload[8:16], payload[16:]], opts=opts, p=1)
+    reassembler = IPReassembler()
+
+    reassembler.push(fragments[1], 1)
+    reassembler.push(fragments[0], 2)
+    datagram = reassembler.push(fragments[2], 3)
+
+    assert datagram.hl == 6
+    assert datagram.opts == opts
+    assert datagram.len == IP_HDR_LEN + len(opts) + len(payload)
+    assert bytes(datagram.data) == payload
+    assert dpkt.in_cksum(datagram.pack_hdr() + datagram.opts) == 0
+    assert bytes(IP(bytes(datagram)).data) == payload
+
+
+def test_ip_reassembly_missing_first_and_last_expire():
+    payload = _test_payload()
+    fragments = _test_fragment([payload[:8], payload[8:16], payload[16:24], payload[24:]])
+
+    missing_first = IPReassembler(timeout=10)
+    missing_first.push(fragments[1], 1)
+    missing_first.push(fragments[2], 2)
+    assert missing_first.push(fragments[3], 3) is None
+    drops = missing_first.expire(13)
+    assert len(drops) == 1
+    assert drops[0].reason == 'timeout'
+    assert missing_first.group_count == 0
+
+    missing_last = IPReassembler(timeout=10)
+    missing_last.push(fragments[0], 1)
+    missing_last.push(fragments[1], 2)
+    assert missing_last.push(fragments[2], 3) is None
+    drops = missing_last.expire(20)
+    assert [drop.reason for drop in drops] == ['timeout']
+    assert missing_last.group_count == 0
+
+
+def test_ip_reassembly_duplicate_identification_reuse_after_expiry():
+    payload = _test_payload()
+    fragments = _test_fragment([payload[:8], payload[8:16], payload[16:24], payload[24:]])
+    reassembler = IPReassembler(timeout=10)
+
+    reassembler.push(fragments[0], 0)
+    assert reassembler.push(fragments[1], 1) is None
+    assert reassembler.expire(11)[0].reason == 'timeout'
+
+    datagram = None
+    for timestamp, fragment in enumerate(fragments, start=12):
+        datagram = reassembler.push(fragment, timestamp)
+
+    assert datagram is not None
+    assert bytes(datagram.data) == payload
+    assert [drop.reason for drop in reassembler.dropped] == ['timeout']
+
+
+def test_ip_reassembly_overlap_conflict():
+    import pytest
+
+    fragments = _test_fragment([_test_payload()[:8], _test_payload()[8:16], _test_payload()[16:]])
+    conflicting = bytearray(fragments[1])
+    conflicting[IP_HDR_LEN] ^= 0xff
+    reassembler = IPReassembler()
+
+    reassembler.push(fragments[0], 1)
+    reassembler.push(bytes(conflicting), 2)
+    with pytest.raises(IPReassemblyError):
+        reassembler.push(fragments[1], 3)
+
+    assert reassembler.group_count == 0
+    assert reassembler.dropped[-1].reason == 'overlap_conflict'
+
+
+def test_ip_reassembly_rejects_fragment_past_known_end():
+    import pytest
+
+    payload = _test_payload()
+    fragments = _test_fragment([payload[:8], payload[8:16], payload[16:24], payload[24:]])
+    last_early = IP(id=0x1234, src=b'\x0a\x00\x00\x01', dst=b'\x0a\x00\x00\x02',
+                    p=17, data=payload[8:16], offset=1, mf=0)
+    last_early.sum = 0
+    last_early = bytes(last_early)
+
+    reassembler = IPReassembler()
+    reassembler.push(fragments[0], 1)
+    reassembler.push(fragments[1], 2)
+    reassembler.push(fragments[2], 3)
+
+    with pytest.raises(IPReassemblyError):
+        reassembler.push(last_early, 4)
+    assert reassembler.dropped[-1].reason == 'fragment_past_end'
+    assert reassembler.group_count == 0
+
+
+def test_ip_reassembler_limits():
+    import pytest
+
+    payload = _test_payload()
+    fragments = _test_fragment([payload[:8], payload[8:16], payload[16:24], payload[24:]])
+
+    max_groups = IPReassembler(max_groups=1, max_buffered_bytes=None)
+    max_groups.push(fragments[0], 1)
+    other = IP(id=0x5678, src=b'\x0a\x00\x00\x01', dst=b'\x0a\x00\x00\x02',
+               p=17, data=b'abcdefgh', offset=0, mf=1)
+    other.sum = 0
+    other = bytes(other)
+    with pytest.raises(IPReassemblyError):
+        max_groups.push(other, 2)
+    assert max_groups.dropped[-1].reason == 'max_groups'
+
+    max_bytes = IPReassembler(max_groups=None, max_buffered_bytes=25)
+    with pytest.raises(IPReassemblyError):
+        max_bytes.push(fragments[0], 1)
+    assert max_bytes.dropped[-1].reason == 'max_buffered_bytes'
+    assert max_bytes.group_count == 0
+
+    cross_group = IPReassembler(max_groups=None, max_buffered_bytes=59)
+    cross_group.push(fragments[0], 1)
+    other = IP(id=0x5678, src=b'\x0a\x00\x00\x01', dst=b'\x0a\x00\x00\x02',
+               p=17, data=b'Y' * 32, offset=1, mf=1)
+    other.sum = 0
+    with pytest.raises(IPReassemblyError):
+        cross_group.push(bytes(other), 2)
+    assert cross_group.dropped[-1].reason == 'max_buffered_bytes'
+    assert cross_group.group_count == 1
