@@ -502,3 +502,9 @@ def test_default_udp_checksum():
 def test_get_proto_name():
     assert get_ip_proto_name(6) == 'TCP'
     assert get_ip_proto_name(999) is None
+
+
+from . import ipreassembler  # noqa: E402,F401
+
+IPReassembler = ipreassembler.IPReassembler  # noqa: F401
+IPDefrag = ipreassembler.IPDefrag  # noqa: F401

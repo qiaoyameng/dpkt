@@ -223,6 +223,14 @@ dpkt.ip6 module
     :undoc-members:
     :show-inheritance:
 
+dpkt.ipreassembler module
+-------------------------
+
+.. automodule:: dpkt.ipreassembler
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.ipx module
 ---------------
 
@@ -534,4 +542,3 @@ dpkt.yahoo module
     :members:
     :undoc-members:
     :show-inheritance:
-
