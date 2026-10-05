@@ -142,6 +142,222 @@ class IP6(dpkt.Packet):
             return baselen + sum(len(hh) for hh in self.extension_hdrs.values())
         return baselen
 
+    def edit_extension_headers(self, edits):
+        """Insert, replace or delete extension headers by wire position.
+
+        ``edits`` is an iterable of 3-tuples ``(op, index, header)``:
+
+        - ``op`` is one of ``'insert'``, ``'replace'`` or ``'delete'``.
+        - ``index`` is a zero-based position in the current extension header
+          chain; ``'insert'`` takes 0..len(chain) (the new header is placed at
+          that position), ``'replace'`` and ``'delete'`` take 0..len(chain)-1.
+        - ``header`` is the new extension header for ``'insert'``/``'replace'``,
+          either an :class:`IP6ExtensionHeader` instance or an
+          ``(proto_number, header_instance)`` tuple; it is ignored on delete.
+
+        Edits are applied to a private working copy, so a failure leaves the
+        packet and every one of its bytes untouched. On success the next-header
+        pointers, ``plen`` and the legacy ``extension_hdrs`` mapping are
+        rebuilt. TCP/UDP/ICMPv6 pseudo-header checksums only need work when they
+        were never computed (e.g. locally built packets); if a required
+        checksum cannot be recomputed because the full upper-layer packet is
+        not available (a non-first fragment), :class:`dpkt.NeedData` is raised
+        instead of guessing. Structural problems raise :class:`ValueError`.
+        """
+        snapshot = self._ext_hdrs_snapshot()
+        try:
+            chain = list(self.all_extension_headers)
+            new_chain = self._apply_ext_hdr_edits(edits, chain)
+            self._validate_ext_hdr_chain(new_chain)
+            terminal_nxt = chain[-1].nxt if chain else self.nxt
+            self._relink_ext_hdr_chain(new_chain, terminal_nxt)
+            ext_bytes = b''.join(bytes(h) for h in new_chain)
+            data_bytes = bytes(self.data)
+            new_plen = len(ext_bytes) + len(data_bytes)
+            if new_plen > 65535:
+                raise ValueError('payload length exceeds 65535; jumbograms are not supported')
+            if not new_chain:
+                self.nxt = terminal_nxt
+            else:
+                self.nxt = _ext_hdr_proto(new_chain[0])
+            self._fix_upper_layer_checksum()
+        except Exception:
+            self._ext_hdrs_restore(snapshot)
+            raise
+
+        self.all_extension_headers = new_chain
+        self.extension_hdrs = {}
+        for hdr in new_chain:
+            self.extension_hdrs[_ext_hdr_proto(hdr)] = hdr
+        self.plen = new_plen
+        self.p = terminal_nxt
+        return self
+
+    def _ext_hdrs_snapshot(self):
+        if not hasattr(self, 'all_extension_headers'):
+            self.all_extension_headers = []
+        if not hasattr(self, 'extension_hdrs'):
+            self.extension_hdrs = {}
+        if not hasattr(self, 'p'):
+            self.p = None
+        hdrs = list(self.all_extension_headers)
+        return {
+            'nxt': self.nxt,
+            'p': getattr(self, 'p', None),
+            'plen': self.plen,
+            'all': hdrs,
+            'nxt_values': [getattr(h, 'nxt', None) for h in hdrs],
+            'dict': dict(self.extension_hdrs),
+        }
+
+    def _ext_hdrs_restore(self, snapshot):
+        self.nxt = snapshot['nxt']
+        self.p = snapshot['p']
+        self.plen = snapshot['plen']
+        self.all_extension_headers = list(snapshot['all'])
+        self.extension_hdrs = dict(snapshot['dict'])
+        for hdr, nxt in zip(snapshot['all'], snapshot['nxt_values']):
+            if nxt is not None or hasattr(hdr, 'nxt'):
+                hdr.nxt = nxt
+
+    @staticmethod
+    def _apply_ext_hdr_edits(edits, chain):
+        # Every index addresses the *original* chain. Inserts at position k
+        # are placed before the original header k (or at the end for k == n);
+        # several inserts sharing a position keep the order in which they were
+        # given (later inserts land after earlier ones).
+        inserts = {}
+        replaced = {}
+        deleted = set()
+        n = len(chain)
+        for edit in edits:
+            try:
+                op, index = edit[0], edit[1]
+            except (TypeError, IndexError, KeyError):
+                raise ValueError('each edit must be a (op, index, header) tuple')
+            header = edit[2] if len(edit) > 2 else None
+            if op not in ('insert', 'replace', 'delete'):
+                raise ValueError('unsupported edit op: %r' % (op,))
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise ValueError('edit index must be an int')
+            if not 0 <= index <= n:
+                raise ValueError('edit index %d out of range 0..%d' % (index, n))
+            if op == 'insert':
+                _, new_header = _coerce_ext_hdr(header)
+                inserts.setdefault(index, []).insert(0, new_header)
+            elif op == 'replace':
+                if index == n:
+                    raise ValueError('replace index %d out of range 0..%d' % (index, n - 1))
+                if index in deleted:
+                    raise ValueError('position %d is both replaced and deleted' % index)
+                if index in replaced:
+                    raise ValueError('position %d is edited more than once' % index)
+                _, new_header = _coerce_ext_hdr(header)
+                replaced[index] = new_header
+            else:
+                if index == n:
+                    raise ValueError('delete index %d out of range 0..%d' % (index, n - 1))
+                if index in replaced:
+                    raise ValueError('position %d is both replaced and deleted' % index)
+                if index in deleted:
+                    raise ValueError('position %d is edited more than once' % index)
+                deleted.add(index)
+
+        working = []
+        for index in range(n):
+            working.extend(inserts.get(index, ()))
+            if index in deleted:
+                continue
+            working.append(replaced.get(index, chain[index]))
+        working.extend(inserts.get(n, ()))
+        return working
+
+    @staticmethod
+    def _validate_ext_hdr_chain(chain):
+        # ESP terminates the extension chain and has no parseable length or
+        # next-header field; never guess our way past it, just refuse to edit.
+        for proto, hdr in ((_ext_hdr_proto(h), h) for h in chain):
+            if proto == ip.IP_PROTO_ESP:
+                raise ValueError('cannot edit a chain containing ESP (no length/next-header rule)')
+            declared = _ext_hdr_byte_len(hdr)
+            if declared <= 0 or declared != len(bytes(hdr)):
+                raise ValueError('extension header %r has an indeterminate/inconsistent length' % (hdr,))
+        hop = [h for h in chain if _ext_hdr_proto(h) == ip.IP_PROTO_HOPOPTS]
+        if len(hop) > 1 or (hop and chain[0] is not hop[0]):
+            raise ValueError('Hop-by-Hop Options must be the first extension header')
+        frags = [h for h in chain if _ext_hdr_proto(h) == ip.IP_PROTO_FRAGMENT]
+        if len(frags) > 1:
+            raise ValueError('only one Fragment header is allowed')
+        dstopts = [h for h in chain if _ext_hdr_proto(h) == ip.IP_PROTO_DSTOPTS]
+        if len(dstopts) > 2:
+            raise ValueError('at most two Destination Options headers are allowed')
+        if frags:
+            # Per RFC 8200 only Destination Options may occur after the Fragment
+            # header; Hop-by-Hop/Routing/etc. before it are fine.
+            after_frag = chain[chain.index(frags[0]) + 1:]
+            for hdr in after_frag:
+                if _ext_hdr_proto(hdr) != ip.IP_PROTO_DSTOPTS:
+                    raise ValueError('only Destination Options may follow the Fragment header')
+        if len(b''.join(bytes(h) for h in chain)) > 65535:
+            raise ValueError('extension headers exceed the payload length limit')
+
+    @staticmethod
+    def _relink_ext_hdr_chain(chain, terminal_nxt):
+        for pos, hdr in enumerate(chain):
+            nxt = terminal_nxt if pos == len(chain) - 1 else _ext_hdr_proto(chain[pos + 1])
+            hdr.nxt = nxt
+
+    def _fix_upper_layer_checksum(self):
+        if self.p not in (ip.IP_PROTO_TCP, ip.IP_PROTO_UDP, ip.IP_PROTO_ICMP6):
+            return
+        data = self.data
+        if not isinstance(data, dpkt.Packet) or not hasattr(data, 'sum'):
+            # No reachable upper-layer checksum field (e.g. a non-first fragment
+            # whose payload is kept as opaque bytes). Extension header edits do
+            # not change the pseudo-header, so leave the bytes untouched instead
+            # of pretending a recomputation happened.
+            return
+        frag = next((h for h in self.all_extension_headers
+                     if _ext_hdr_proto(h) == ip.IP_PROTO_FRAGMENT), None)
+        if not data.sum:
+            # Zero means "not computed yet". A valid result needs the *whole*
+            # transport datagram; a fragment header means that length is unknown.
+            if frag is not None:
+                raise dpkt.NeedData(
+                    'cannot compute the upper-layer checksum without the full transport packet')
+            payload = bytes(data)
+            pseudo = struct.pack('>16s16sxBH', self.src, self.dst, self.p, len(payload))
+            s = dpkt.in_cksum_add(0, pseudo)
+            s = dpkt.in_cksum_add(s, payload)
+            data.sum = dpkt.in_cksum_done(s)
+
+    def _ext_hdrs_snapshot(self):
+        if not hasattr(self, 'all_extension_headers'):
+            self.all_extension_headers = []
+        if not hasattr(self, 'extension_hdrs'):
+            self.extension_hdrs = {}
+        if not hasattr(self, 'p'):
+            self.p = None
+        hdrs = list(self.all_extension_headers)
+        return {
+            'nxt': self.nxt,
+            'p': getattr(self, 'p', None),
+            'plen': self.plen,
+            'all': hdrs,
+            'nxt_values': [getattr(h, 'nxt', None) for h in hdrs],
+            'dict': dict(self.extension_hdrs),
+        }
+
+    def _ext_hdrs_restore(self, snapshot):
+        self.nxt = snapshot['nxt']
+        self.p = snapshot['p']
+        self.plen = snapshot['plen']
+        self.all_extension_headers = list(snapshot['all'])
+        self.extension_hdrs = dict(snapshot['dict'])
+        for hdr, nxt in zip(snapshot['all'], snapshot['nxt_values']):
+            if nxt is not None or hasattr(hdr, 'nxt'):
+                hdr.nxt = nxt
+
     @classmethod
     def set_proto(cls, p, pktclass):
         cls._protosw[p] = pktclass
@@ -298,6 +514,54 @@ EXT_HDRS_CLS = {ip.IP_PROTO_HOPOPTS: IP6HopOptsHeader,
                 ip.IP_PROTO_ESP: IP6ESPHeader,
                 ip.IP_PROTO_AH: IP6AHHeader,
                 ip.IP_PROTO_DSTOPTS: IP6DstOptsHeader}
+
+
+def _ext_hdr_proto(hdr):
+    """Return the IPv6 next-header protocol number of an extension header."""
+    for proto, cls in EXT_HDRS_CLS.items():
+        if isinstance(hdr, cls):
+            return proto
+    raise ValueError('unknown extension header type: %r' % (hdr,))
+
+
+def _coerce_ext_hdr(header):
+    if isinstance(header, tuple) and len(header) == 2:
+        proto, hdr = header
+        if not isinstance(proto, int) or not isinstance(hdr, IP6ExtensionHeader):
+            raise ValueError('extension header tuples must be (int proto, IP6ExtensionHeader)')
+        if _ext_hdr_proto(hdr) != proto:
+            raise ValueError('extension header protocol number does not match its class')
+    elif isinstance(header, IP6ExtensionHeader):
+        proto = _ext_hdr_proto(header)
+        hdr = header
+    else:
+        raise ValueError('extension header must be an IP6ExtensionHeader instance')
+    declared = _ext_hdr_byte_len(hdr)
+    packed = bytes(hdr)
+    if declared <= 0 or declared != len(packed):
+        raise ValueError('extension header %r has an indeterminate/inconsistent length' % (hdr,))
+    # Round-trip through the parser: refuse anything we cannot walk again.
+    reparsed = EXT_HDRS_CLS[proto](packed)
+    if _ext_hdr_byte_len(reparsed) != declared or bytes(reparsed) != packed:
+        raise ValueError('extension header %r is not self-consistent' % (hdr,))
+    return proto, hdr
+
+
+def _ext_hdr_byte_len(hdr):
+    """On-wire length of an extension header from its length field, not data."""
+    if isinstance(hdr, IP6OptsHeader):
+        return (hdr.len + 1) * 8
+    if isinstance(hdr, IP6RoutingHeader):
+        return hdr.len * 8 + 8
+    if isinstance(hdr, IP6FragmentHeader):
+        return hdr.__hdr_len__
+    if isinstance(hdr, IP6AHHeader):
+        return (hdr.len + 2) * 4
+    length = getattr(hdr, 'length', None)
+    if not isinstance(length, int):
+        raise ValueError('extension header %r has no length rule' % (hdr,))
+    return length
+
 
 # Unit tests
 
@@ -587,3 +851,208 @@ def test_ip6_fragment_no_decode():  # https://github.com/kbandla/dpkt/issues/575
 
     # test packing
     assert bytes(frag2) == s
+
+
+def _test_ext_edit_build_packet(pkt_cls, proto, payload):
+    from . import tcp as _tcp
+    from . import udp as _udp
+    transport = pkt_cls()
+    transport.sport = 12345
+    transport.dport = 443
+    transport.data = payload
+    if isinstance(transport, _udp.UDP):
+        transport.ulen = len(transport)
+    pkt = IP6()
+    pkt.src = b'\x20\x01\x0d\xb8' + b'\x00' * 12
+    pkt.dst = b'\x20\x01\x0d\xb8' + b'\x00' * 11 + b'\x01'
+    pkt.hlim = 64
+    pkt.nxt = proto
+    pkt.data = transport
+    pkt.plen = len(transport)
+    raw = bytes(pkt)
+    return IP6(raw), raw
+
+
+def _test_ext_edit_dstopts(length_field=0):
+    hdr = IP6DstOptsHeader()
+    hdr.len = length_field
+    hdr.data = b'\x00' * ((length_field + 1) * 8 - 2)
+    return hdr
+
+
+def _test_ext_edit_routing():
+    hdr = IP6RoutingHeader()
+    hdr.len = 0
+    hdr.type = 0
+    hdr.segs_left = 0
+    hdr.data = b''
+    return hdr
+
+
+def _test_ext_edit_fragment():
+    hdr = IP6FragmentHeader()
+    hdr.frag_off = 0
+    hdr.m_flag = 0
+    hdr.id = 0x11223344
+    return hdr
+
+
+def test_ip6_edit_extension_headers_roundtrip():
+    # Two Destination Options headers (one on each side of the fragment
+    # header), a Routing header and a Fragment header: the ordered list keeps
+    # the duplicate Destination Options that the extension_hdrs dict loses.
+    pkt, raw = _test_ext_edit_build_packet(tcp.TCP, ip.IP_PROTO_TCP, b'hello-world')
+    checksum = pkt.data.sum
+    assert checksum != 0
+    assert pkt.all_extension_headers == []
+
+    d0 = _test_ext_edit_dstopts(0)
+    rh = _test_ext_edit_routing()
+    fh = _test_ext_edit_fragment()
+    d1 = _test_ext_edit_dstopts(1)
+    pkt.edit_extension_headers([
+        ('insert', 0, d1),
+        ('insert', 0, fh),
+        ('insert', 0, rh),
+        ('insert', 0, d0),
+    ])
+    assert [type(h).__name__ for h in pkt.all_extension_headers] == [
+        'IP6DstOptsHeader', 'IP6RoutingHeader', 'IP6FragmentHeader', 'IP6DstOptsHeader']
+    assert len(pkt.all_extension_headers) == 4
+    # the legacy mapping collapses the duplicate Destination Options entry
+    assert len(pkt.extension_hdrs) == 3
+
+    # every next-header pointer is rebuilt in wire order
+    assert pkt.nxt == ip.IP_PROTO_DSTOPTS
+    assert pkt.all_extension_headers[0].nxt == ip.IP_PROTO_ROUTING
+    assert pkt.all_extension_headers[1].nxt == ip.IP_PROTO_FRAGMENT
+    assert pkt.all_extension_headers[2].nxt == ip.IP_PROTO_DSTOPTS
+    assert pkt.all_extension_headers[3].nxt == ip.IP_PROTO_TCP
+    assert pkt.p == ip.IP_PROTO_TCP
+
+    # payload length rebuilt (8+8+8+16 bytes of extension headers)
+    assert pkt.plen == 40 + len(bytes(pkt.data))
+    assert len(pkt) == len(bytes(pkt))
+    # the pseudo-header is unchanged, so the TCP checksum stays valid
+    assert pkt.data.sum == checksum
+
+    edited = bytes(pkt)
+    reparsed = IP6(edited)
+    assert reparsed.data.sum == checksum
+
+    # remove all four headers (indices address the original chain) and get the
+    # exact plain packet back
+    reparsed.edit_extension_headers([('delete', 3), ('delete', 2),
+                                    ('delete', 1), ('delete', 0)])
+    assert reparsed.all_extension_headers == []
+    assert reparsed.nxt == ip.IP_PROTO_TCP
+    assert reparsed.p == ip.IP_PROTO_TCP
+    assert bytes(reparsed) == raw
+
+    # replace the trailing Destination Options header in place
+    replaced = IP6(edited)
+    replacement = _test_ext_edit_dstopts(0)
+    replaced.edit_extension_headers([('replace', 3, replacement)])
+    assert len(replaced.all_extension_headers) == 4
+    assert replaced.all_extension_headers[2].nxt == ip.IP_PROTO_DSTOPTS
+    assert replaced.all_extension_headers[3].nxt == ip.IP_PROTO_TCP
+    assert replaced.plen == 32 + len(bytes(replaced.data))
+
+
+def test_ip6_edit_extension_headers_plain_tcp_udp():
+    from . import udp
+    for transport_cls, proto in ((tcp.TCP, ip.IP_PROTO_TCP),
+                                 (udp.UDP, ip.IP_PROTO_UDP)):
+        pkt, raw = _test_ext_edit_build_packet(transport_cls, proto, b'abc')
+        assert pkt.nxt == proto
+        assert pkt.p == proto
+        assert bytes(pkt) == raw
+
+        d0 = _test_ext_edit_dstopts(0)
+        pkt.edit_extension_headers([('insert', 0, d0)])
+        assert pkt.nxt == ip.IP_PROTO_DSTOPTS
+        assert pkt.all_extension_headers[0].nxt == proto
+        assert pkt.p == proto
+        assert pkt.plen == 8 + len(bytes(pkt.data))
+
+        pkt.edit_extension_headers([('delete', 0)])
+        assert pkt.all_extension_headers == []
+        assert pkt.nxt == proto
+        assert bytes(pkt) == raw
+
+
+def test_ip6_edit_extension_headers_failure_is_atomic():
+    import pytest
+    pkt, raw = _test_ext_edit_build_packet(tcp.TCP, ip.IP_PROTO_TCP, b'hello')
+
+    with pytest.raises(ValueError):
+        pkt.edit_extension_headers([('delete', 0)])  # nothing to delete
+    with pytest.raises(ValueError):
+        pkt.edit_extension_headers([('insert', 5, _test_ext_edit_dstopts(0))])
+    with pytest.raises(ValueError):
+        pkt.edit_extension_headers([('bogus', 0, _test_ext_edit_dstopts(0))])
+    with pytest.raises(ValueError):
+        pkt.edit_extension_headers([('insert', 0, b'not-a-header')])
+
+    # a valid edit followed by an invalid one must roll the whole packet back
+    with pytest.raises(ValueError):
+        pkt.edit_extension_headers([
+            ('insert', 0, _test_ext_edit_dstopts(0)),
+            ('delete', 9),
+        ])
+    assert pkt.all_extension_headers == []
+    assert pkt.nxt == ip.IP_PROTO_TCP
+    assert pkt.p == ip.IP_PROTO_TCP
+    assert pkt.plen == len(bytes(pkt.data))
+    assert bytes(pkt) == raw
+
+    # structurally illegal: Routing header after the Fragment header
+    with pytest.raises(ValueError):
+        pkt.edit_extension_headers([
+            ('insert', 0, _test_ext_edit_fragment()),
+            ('insert', 1, _test_ext_edit_routing()),
+        ])
+    assert bytes(pkt) == raw
+
+    # three Destination Options are not legal
+    pkt.edit_extension_headers([
+        ('insert', 0, _test_ext_edit_dstopts(0)),
+        ('insert', 0, _test_ext_edit_dstopts(0)),
+    ])
+    with pytest.raises(ValueError):
+        pkt.edit_extension_headers([('insert', 0, _test_ext_edit_dstopts(0))])
+    assert len(pkt.all_extension_headers) == 2
+    assert bytes(IP6(bytes(pkt))) == bytes(pkt)
+
+
+def test_ip6_edit_extension_headers_nonfirst_fragment():
+    import pytest
+    from . import udp
+    # non-first fragment fixture: the upper layer is opaque bytes, and the full
+    # transport packet is unavailable, so a checksum must never be faked
+    s = (b'\x60\x00\x00\x00\x01\x34\x2c\x35\x20\x01\x05\x00\x00\x60\x00\x00'
+         b'\x00\x00\x00\x00\x00\x00\x00\x30\x20\x01\x06\x38\x05\x01\x8e\xfe'
+         b'\xcc\x4a\x48\x39\xfa\x79\x04\xdc'
+         b'\x11\x72\x31\xb9\xc1\x0f\xcf\x7c\x61\x62\x63\x64\x65\x66\x67\x68')
+    pkt = IP6(s)
+    assert type(pkt.data) == bytes
+
+    with pytest.raises(ValueError):
+        pkt.edit_extension_headers([('delete', 5)])  # out of range
+    assert bytes(pkt) == s
+
+    # zero checksum cannot be computed on a fragmented packet: refuse honestly
+    incomplete = IP6()
+    incomplete.src = b'\x20\x01\x0d\xb8' + b'\x00' * 12
+    incomplete.dst = b'\x20\x01\x0d\xb8' + b'\x00' * 11 + b'\x01'
+    incomplete.hlim = 64
+    incomplete.data = udp.UDP(sport=1, dport=2, ulen=9, sum=0, data=b'x')
+    incomplete.nxt = ip.IP_PROTO_FRAGMENT
+    fh = _test_ext_edit_fragment()
+    fh.m_flag = 1
+    incomplete.all_extension_headers = [fh]
+    incomplete.extension_hdrs = {ip.IP_PROTO_FRAGMENT: fh}
+    incomplete.p = ip.IP_PROTO_UDP
+    incomplete.plen = 8 + len(bytes(incomplete.data))
+    with pytest.raises(dpkt.NeedData):
+        incomplete.edit_extension_headers([('insert', 1, _test_ext_edit_dstopts(0))])
