@@ -351,6 +351,14 @@ dpkt.radius module
     :undoc-members:
     :show-inheritance:
 
+dpkt.rewrite module
+-------------------
+
+.. automodule:: dpkt.rewrite
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.rfb module
 ---------------
 
@@ -534,4 +542,3 @@ dpkt.yahoo module
     :members:
     :undoc-members:
     :show-inheritance:
-

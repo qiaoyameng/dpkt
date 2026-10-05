@@ -53,6 +53,7 @@ from . import pppoe
 from . import qq
 from . import radiotap
 from . import radius
+from . import rewrite
 from . import rfb
 from . import rip
 from . import rpc
