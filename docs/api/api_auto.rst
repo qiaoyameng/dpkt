@@ -479,6 +479,14 @@ dpkt.tcp module
     :undoc-members:
     :show-inheritance:
 
+dpkt.tcpao module
+-----------------
+
+.. automodule:: dpkt.tcpao
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.telnet module
 ------------------
 
@@ -534,4 +542,3 @@ dpkt.yahoo module
     :members:
     :undoc-members:
     :show-inheritance:
-
