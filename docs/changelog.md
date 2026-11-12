@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+- Added NetFlow v9 (RFC 3954) Export Packet parsing: Template FlowSets,
+  Options Template FlowSets and Data FlowSets, with common fixed-width field
+  decoding and raw-byte preservation for unknown or vendor-specific fields
+- Added `Netflow9Collector`, a stateful collector interface with template
+  caching isolated by exporter session, Source ID and Template ID, explicit
+  replacement/expiry/restart rules, bounded data-before-template buffering and
+  a JSON-friendly `state()` snapshot
+- Truncated records, zero padding and unsupported variable-length layouts are
+  reported explicitly instead of being decoded as complete records
+
 ## 1.9.8
 **[2022-08-17]**
 - Fixed endianness issues in PCAPNG, Loopback
