@@ -46,6 +46,7 @@ from . import ntp
 from . import ospf
 from . import pcap
 from . import pcapng
+from . import pcapmerge
 from . import pim
 from . import pmap
 from . import ppp

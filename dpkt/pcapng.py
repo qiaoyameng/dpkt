@@ -705,6 +705,18 @@ class Reader(object):
             # just ignore other blocks
 
 
+def merge(sources, destination, **kwargs):
+    """Merge pcap/pcapng ``sources`` into one pcapng ``destination``.
+
+    Convenience re-export of :func:`dpkt.pcapmerge.merge`, which documents the
+    ``on_*`` policies, the exact-timestamp and per-interface guarantees, and
+    returns a :class:`dpkt.pcapmerge.MergeReport`.  Imported lazily so that
+    ``dpkt.pcapmerge`` can import this module without a cycle.
+    """
+    from .pcapmerge import merge as _merge
+    return _merge(sources, destination, **kwargs)
+
+
 #########
 # TESTS #
 #########

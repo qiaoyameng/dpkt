@@ -295,6 +295,14 @@ dpkt.pcap module
     :undoc-members:
     :show-inheritance:
 
+dpkt.pcapmerge module
+---------------------
+
+.. automodule:: dpkt.pcapmerge
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.pim module
 ---------------
 
