@@ -409,20 +409,70 @@ class PacketBlockLE(PacketBlock):
     __byte_order__ = '<'
 
 
+def _idb_tsresol(idb):
+    """Return the timestamp resolution multiplier declared by an IDB (default: microseconds)."""
+    for opt in getattr(idb, 'opts', None) or []:
+        if opt.code == PCAPNG_OPT_IF_TSRESOL and opt.data:
+            val = struct_unpack('b', opt.data[:1])[0]
+            # MSB set: resolution is 2 ** -val, otherwise 10 ** -val
+            return 2 ** (val & 0x7f) if val & 0x80 else 10 ** val
+    return 1000000
+
+
+def _idb_opts_key(idb):
+    """Return a comparable key of an IDB's options, excluding opt_endofopt and if_tsresol."""
+    return tuple(
+        (opt.code, bytes(opt.data))
+        for opt in (getattr(idb, 'opts', None) or [])
+        if opt.code not in (PCAPNG_OPT_ENDOFOPT, PCAPNG_OPT_IF_TSRESOL)
+    )
+
+
+class _SectionInfo(object):
+    """Bookkeeping for an existing section when appending to a file."""
+
+    __slots__ = ('offset', 'le', 'idbs')
+
+    def __init__(self, offset, le):
+        self.offset = offset
+        self.le = le  # True if the section is little-endian
+        self.idbs = []  # parsed InterfaceDescriptionBlock(LE) of this section
+
+
 class Writer(object):
     """Simple pcapng dumpfile writer."""
 
     __le = sys.byteorder == 'little'
 
-    def __init__(self, fileobj, snaplen=1500, linktype=DLT_EN10MB, shb=None, idb=None):
+    def __init__(self, fileobj, snaplen=1500, linktype=DLT_EN10MB, shb=None, idb=None,
+                 append=False, recover=False):
         """
         Create a pcapng dumpfile writer for the given fileobj.
 
         shb can be an instance of SectionHeaderBlock(LE)
         idb can be an instance of InterfaceDescriptionBlock(LE) (or sequence of them)
+
+        With append=True, open an existing pcapng stream for appending without
+        rewriting its history. The existing block structure is validated first;
+        complete historical blocks are preserved byte-for-byte. The last section
+        is then reused (adopting its endianness, and matching its interfaces by
+        linktype, snaplen, timestamp resolution and remaining options; a new IDB
+        is declared when no existing interface matches), unless shb is given or
+        no valid section exists, in which case a new section is started
+        explicitly. fileobj must be seekable, readable and writable; close()
+        only flushes it, leaving the caller-owned handle open.
+
+        If the file ends with an incomplete (truncated) block, appending is
+        refused by default. With recover=True, the single incomplete trailing
+        block is dropped and the truncation offset is reported in .truncated_at;
+        corruption anywhere else in the file is always rejected.
         """
         self.__f = fileobj
+        self.__append = append
         self._precision_multiplier = 1000000
+        self._iface_id = 0
+        self._failed = False
+        self.truncated_at = None
 
         if shb:
             self._validate_block('shb', shb, SectionHeaderBlock)
@@ -434,6 +484,10 @@ class Writer(object):
                 self._validate_block('idb', idb, InterfaceDescriptionBlock)
                 idb = [idb]
 
+        if append:
+            self.__open_append(snaplen, linktype, shb, idb, recover)
+            return
+
         if self.__le:
             shb = shb or SectionHeaderBlockLE()
             idb = idb or [InterfaceDescriptionBlockLE(snaplen=snaplen, linktype=linktype)]
@@ -443,9 +497,204 @@ class Writer(object):
             idb = idb or [InterfaceDescriptionBlock(snaplen=snaplen, linktype=linktype)]
             self._kls = EnhancedPacketBlock
 
-        self.__f.write(bytes(shb))
+        self.__write(bytes(shb))
         for idb_ in idb:
-            self.__f.write(bytes(idb_))
+            self.__write(bytes(idb_))
+
+    def __open_append(self, snaplen, linktype, shb, idb, recover):
+        """Validate the existing file and position the writer for appending."""
+        f = self.__f
+        for meth in ('seek', 'tell', 'read', 'write'):
+            if not callable(getattr(f, meth, None)):
+                raise ValueError(
+                    'append mode requires a seekable, readable and writable file object')
+
+        sections = self.__scan_sections(recover)
+
+        if shb is not None or not sections:
+            # start a new section explicitly
+            if self.__le:
+                shb = shb or SectionHeaderBlockLE()
+                idb = idb or [InterfaceDescriptionBlockLE(snaplen=snaplen, linktype=linktype)]
+                self._kls = EnhancedPacketBlockLE
+            else:
+                shb = shb or SectionHeaderBlock()
+                idb = idb or [InterfaceDescriptionBlock(snaplen=snaplen, linktype=linktype)]
+                self._kls = EnhancedPacketBlock
+            f.seek(0, 2)
+            self.__write(bytes(shb))
+            for idb_ in idb:
+                self.__write(bytes(idb_))
+            return
+
+        # reuse the last section, honoring its on-disk endianness
+        section = sections[-1]
+        self.__le = section.le
+        if section.le:
+            self._kls = EnhancedPacketBlockLE
+            idb_kls = InterfaceDescriptionBlockLE
+            opt_kls = PcapngOptionLE
+        else:
+            self._kls = EnhancedPacketBlock
+            idb_kls = InterfaceDescriptionBlock
+            opt_kls = PcapngOption
+
+        candidate = idb[0] if idb else None
+        if candidate is not None:
+            # adopt the timestamp resolution of the requested interface
+            self._precision_multiplier = _idb_tsresol(candidate)
+        else:
+            candidate = idb_kls(snaplen=snaplen, linktype=linktype)
+            self.__ensure_tsresol(candidate, opt_kls)
+
+        iface_id = None
+        for idx, existing in enumerate(section.idbs):
+            if (existing.linktype == candidate.linktype
+                    and existing.snaplen == candidate.snaplen
+                    and _idb_tsresol(existing) == self._precision_multiplier
+                    and _idb_opts_key(existing) == _idb_opts_key(candidate)):
+                iface_id = idx
+                self._precision_multiplier = _idb_tsresol(existing)
+                break
+
+        f.seek(0, 2)
+        if iface_id is None:
+            # no matching interface: declare a new one in the last section
+            if candidate.__hdr_fmt__[0] != ('<' if section.le else '>'):
+                raise ValueError('idb: endianness does not match the last section')
+            self.__write(bytes(candidate))
+            iface_id = len(section.idbs)
+        self._iface_id = iface_id
+
+    def __ensure_tsresol(self, idb, opt_kls):
+        """Add an if_tsresol option to a default idb when precision is not microseconds."""
+        mult = self._precision_multiplier
+        if mult == 1000000:
+            return
+        val, p = 0, 1
+        while p < mult:
+            p *= 10
+            val += 1
+        if p != mult:
+            val, p = 0, 1
+            while p < mult:
+                p *= 2
+                val += 1
+            if p != mult:
+                raise ValueError('unsupported timestamp precision: {0}'.format(mult))
+            val |= 0x80
+        idb.opts = [opt_kls(code=PCAPNG_OPT_IF_TSRESOL, data=struct_pack('b', val)),
+                    opt_kls()]
+
+    def __scan_sections(self, recover):
+        """Scan the file, validating the structure of every block.
+
+        Returns a list of _SectionInfo. A truncated trailing block is only
+        dropped when recover is True; anything else raises dpkt.UnpackError.
+        """
+        f = self.__f
+        f.seek(0, 2)
+        filesize = f.tell()
+
+        sections = []
+        section = None
+        offset = 0
+        truncated_at = None
+        shb_type_bytes = struct_pack('<I', PCAPNG_BT_SHB)  # endianness-neutral
+
+        while offset < filesize:
+            f.seek(offset)
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                truncated_at = offset
+                break
+
+            if hdr[:4] == shb_type_bytes:
+                f.seek(offset + 8)
+                bom_buf = f.read(8)  # byte-order magic + version
+                if len(bom_buf) < 8:
+                    truncated_at = offset
+                    break
+                if bom_buf[:4] == struct_pack('<I', BYTE_ORDER_MAGIC):
+                    le = True
+                elif bom_buf[:4] == struct_pack('>I', BYTE_ORDER_MAGIC):
+                    le = False
+                else:
+                    raise dpkt.UnpackError(
+                        'invalid byte-order magic at offset {0}'.format(offset))
+                fmt = '<' if le else '>'
+                v_major, v_minor = struct_unpack(fmt + 'HH', bom_buf[4:8])
+                if v_major != PCAPNG_VERSION_MAJOR:
+                    raise dpkt.UnpackError(
+                        'unknown pcapng version {0}.{1} at offset {2}'.format(
+                            v_major, v_minor, offset))
+            else:
+                if section is None:
+                    raise dpkt.UnpackError(
+                        'block outside a section at offset {0}'.format(offset))
+                le = section.le
+                fmt = '<' if le else '>'
+
+            blk_len = struct_unpack(fmt + 'I', hdr[4:8])[0]
+            blk_type = struct_unpack(fmt + 'I', hdr[:4])[0]
+            if blk_len < 12 or blk_len % 4:
+                raise dpkt.UnpackError(
+                    'invalid block length {0} at offset {1}'.format(blk_len, offset))
+            if blk_type == PCAPNG_BT_SHB and blk_len < 28:
+                raise dpkt.UnpackError(
+                    'invalid section header length {0} at offset {1}'.format(blk_len, offset))
+            if offset + blk_len > filesize:
+                truncated_at = offset
+                break
+            f.seek(offset + blk_len - 4)
+            tail = f.read(4)
+            if len(tail) < 4 or struct_unpack(fmt + 'I', tail)[0] != blk_len:
+                raise dpkt.UnpackError(
+                    'block length fields do not match at offset {0}'.format(offset))
+
+            if blk_type == PCAPNG_BT_SHB:
+                section = _SectionInfo(offset=offset, le=le)
+                sections.append(section)
+            elif blk_type == PCAPNG_BT_IDB:
+                f.seek(offset)
+                buf = f.read(blk_len)
+                idb = (InterfaceDescriptionBlockLE(buf) if le
+                       else InterfaceDescriptionBlock(buf))
+                section.idbs.append(idb)
+            # other (known or unknown) blocks are left untouched
+
+            offset += blk_len
+
+        if truncated_at is not None:
+            if not recover:
+                raise dpkt.UnpackError(
+                    'truncated block at offset {0}; '
+                    'open with recover=True to drop the incomplete block'.format(truncated_at))
+            if not callable(getattr(f, 'truncate', None)):
+                raise ValueError('recovering a truncated file requires truncate()')
+            f.truncate(truncated_at)
+            self.truncated_at = truncated_at
+
+        return sections
+
+    def __write(self, buf):
+        if self._failed:
+            raise RuntimeError('pcapng writer is in a failed state')
+        if not self.__append:
+            self.__f.write(buf)
+            return
+        pos = self.__f.tell()
+        try:
+            self.__f.write(buf)
+        except Exception:
+            # roll back a partially written block so the file is not left with
+            # half a block as a valid starting point for the next append
+            self._failed = True
+            try:
+                self.__f.truncate(pos)
+            except Exception:
+                pass
+            raise
 
     def _validate_block(self, arg_name, blk, expected_cls):
         """Check a user-defined block for correct type and endianness"""
@@ -481,7 +730,7 @@ class Writer(object):
                 pkt.ts_high = ts >> 32
                 pkt.ts_low = ts & 0xffffffff
 
-            self.__f.write(bytes(pkt))
+            self.__write(bytes(pkt))
             return
 
         # pkt is a buffer - wrap it into an EPB
@@ -503,13 +752,14 @@ class Writer(object):
         n = len(s)
 
         epb = self._kls(
+            iface_id=self._iface_id,
             ts_high=ts >> 32,
             ts_low=ts & 0xffffffff,
             caplen=n,
             pkt_len=n,
             pkt_data=s
         )
-        self.__f.write(bytes(epb))
+        self.__write(bytes(epb))
 
     def writepkts(self, pkts):
         """
@@ -517,9 +767,8 @@ class Writer(object):
         """
         kls = self._kls()
         ph = kls._pack_hdr
-        fd = self.__f
 
-        iface_id = kls.iface_id
+        iface_id = self._iface_id
         pkt_type = kls.type
 
         opts_buf = kls._do_pack_options()
@@ -550,10 +799,15 @@ class Writer(object):
                 opts_buf,
                 hdr_buf[-4:]
             ])
-            fd.write(buf)
+            self.__write(buf)
 
     def close(self):
-        self.__f.close()
+        if self.__append:
+            # the handle is owned by the caller; flush but do not close it
+            if callable(getattr(self.__f, 'flush', None)):
+                self.__f.flush()
+        else:
+            self.__f.close()
 
 
 class Reader(object):
@@ -1521,3 +1775,324 @@ def test_posttest():
         fun()
     except Exception as e:
         assert str(e) == 'No test type specified'
+
+
+def _blocks_le(buf):
+    """Test helper: split a little-endian pcapng buffer into (type, block bytes)."""
+    out = []
+    offset = 0
+    while offset < len(buf):
+        blk_type, blk_len = struct_unpack('<II', buf[offset:offset + 8])
+        out.append((blk_type, buf[offset:offset + blk_len]))
+        offset += blk_len
+    return out
+
+
+def test_append_empty_file():
+    """Appending to an empty file writes a fresh SHB+IDB, like a new file"""
+    fobj = BytesIO()
+    writer = Writer(fobj, snaplen=1500, linktype=DLT_EN10MB, append=True)
+    writer.writepkt(b'foo', ts=1454725786.526401)
+    writer.close()
+
+    fobj.seek(0)
+    reader = Reader(fobj)
+    assert reader.snaplen == 1500
+    ts, pkt = next(iter(reader))
+    assert ts == 1454725786.526401
+    assert pkt == b'foo'
+
+
+def test_append_reuse_section():
+    """Appending reuses the last section and preserves history byte-for-byte"""
+    fobj = BytesIO()
+    writer = Writer(fobj, snaplen=1500, linktype=DLT_EN10MB)
+    writer.writepkt(b'foo', ts=1454725786.526401)
+    writer.writepkt(b'bar', ts=1454725787.000002)
+    history = fobj.getvalue()
+
+    appender = Writer(fobj, snaplen=1500, linktype=DLT_EN10MB, append=True)
+    appender.writepkt(b'baz', ts=1454725788.25)
+    appender.close()
+    assert not fobj.closed  # caller-owned handle stays open
+
+    buf = fobj.getvalue()
+    assert buf[:len(history)] == history  # history untouched
+    assert buf.count(b'\x0a\x0d\x0d\x0a') == 1  # no new section was started
+
+    fobj.seek(0)
+    pkts = list(Reader(fobj))
+    assert pkts == [
+        (1454725786.526401, b'foo'),
+        (1454725787.000002, b'bar'),
+        (1454725788.25, b'baz'),
+    ]
+
+
+def test_append_repeated_batches_multi_section():
+    """Repeatedly append small batches to a multi-section file and read back"""
+    fobj = BytesIO()
+    shb, idb, _ = define_testdata().shb_idb_epb
+
+    batches = [
+        ([], {}),  # batch 1: fresh file, default section
+        ([(1454725786.526401, b'a'), (1454725787.000001, b'bb')], {}),
+        ([(1442984653.210838, b'ccc')], {'shb': shb, 'idb': idb}),  # explicit new section
+        ([(1454725790.999999, b'dddd'), (1454725791.5, b'ee')], {}),
+    ]
+    expected = []
+    history = b''
+    for i, (pkts, kwargs) in enumerate(batches):
+        writer = Writer(fobj, snaplen=1500, linktype=DLT_EN10MB, append=True, **kwargs)
+        for ts, pkt in pkts:
+            writer.writepkt(pkt, ts=ts)
+            expected.append((ts, pkt))
+        writer.close()
+        buf = fobj.getvalue()
+        assert buf[:len(history)] == history  # every batch preserves full history
+        history = buf
+
+    assert history.count(b'\x0a\x0d\x0d\x0a') == 2  # two sections total
+
+    fobj.seek(0)
+    assert list(Reader(fobj)) == expected
+
+
+def test_append_new_interface_on_snaplen_change():
+    """Same linktype but different snaplen must declare a separate interface"""
+    fobj = BytesIO()
+    writer = Writer(fobj, snaplen=1500, linktype=DLT_EN10MB)
+    writer.writepkt(b'one', ts=1454725786.526401)
+    history = fobj.getvalue()
+
+    appender = Writer(fobj, snaplen=9000, linktype=DLT_EN10MB, append=True)
+    appender.writepkt(b'two', ts=1454725787.526401)
+
+    buf = fobj.getvalue()
+    assert buf[:len(history)] == history
+    blocks = _blocks_le(buf)
+    assert [t for t, _ in blocks] == [
+        PCAPNG_BT_SHB, PCAPNG_BT_IDB, PCAPNG_BT_EPB, PCAPNG_BT_IDB, PCAPNG_BT_EPB]
+    # the new IDB carries the new snaplen, and the new packet references it
+    assert InterfaceDescriptionBlockLE(blocks[3][1]).snaplen == 9000
+    assert EnhancedPacketBlockLE(blocks[4][1]).iface_id == 1
+
+    fobj.seek(0)
+    assert list(Reader(fobj)) == [
+        (1454725786.526401, b'one'),
+        (1454725787.526401, b'two'),
+    ]
+
+
+def test_append_interface_tsresol_identity():
+    """Interfaces are matched by timestamp resolution, not just linktype"""
+    idb_ns = InterfaceDescriptionBlockLE(snaplen=1500, linktype=DLT_EN10MB, opts=[
+        PcapngOptionLE(code=PCAPNG_OPT_IF_TSRESOL, data=b'\x09'),  # nanoseconds
+        PcapngOptionLE(),
+    ])
+
+    # appending with default (microsecond) precision must declare a new IDB
+    fobj = BytesIO()
+    writer = Writer(fobj, shb=SectionHeaderBlockLE(), idb=idb_ns)
+    writer.writepkt(b'one', ts=1454725786.526401)
+    appender = Writer(fobj, snaplen=1500, linktype=DLT_EN10MB, append=True)
+    appender.writepkt(b'two', ts=1454725787.526401)
+    blocks = _blocks_le(fobj.getvalue())
+    assert [t for t, _ in blocks] == [
+        PCAPNG_BT_SHB, PCAPNG_BT_IDB, PCAPNG_BT_EPB, PCAPNG_BT_IDB, PCAPNG_BT_EPB]
+    assert EnhancedPacketBlockLE(blocks[4][1]).iface_id == 1
+
+    # appending with a matching nanosecond idb reuses the existing interface
+    fobj = BytesIO()
+    writer = Writer(fobj, shb=SectionHeaderBlockLE(), idb=idb_ns)
+    idb_ns2 = InterfaceDescriptionBlockLE(snaplen=1500, linktype=DLT_EN10MB, opts=[
+        PcapngOptionLE(code=PCAPNG_OPT_IF_TSRESOL, data=b'\x09'),
+        PcapngOptionLE(),
+    ])
+    appender = Writer(fobj, idb=idb_ns2, append=True)
+    assert appender._precision_multiplier == 1000000000
+    appender.writepkt(b'three', ts=1454725786.123456789)
+    blocks = _blocks_le(fobj.getvalue())
+    assert [t for t, _ in blocks] == [PCAPNG_BT_SHB, PCAPNG_BT_IDB, PCAPNG_BT_EPB]
+    assert EnhancedPacketBlockLE(blocks[2][1]).iface_id == 0
+
+    fobj.seek(0)
+    ts, pkt = next(iter(Reader(fobj)))
+    assert pkt == b'three'
+    assert ts == intround(1454725786.123456789 * 1000000000) / 1000000000
+
+
+def test_append_big_endian_section():
+    """Appending to a big-endian section writes big-endian blocks"""
+    _sysle = Writer._Writer__le
+    Writer._Writer__le = False
+    try:
+        fobj = BytesIO()
+        writer = Writer(fobj, snaplen=1500, linktype=DLT_EN10MB)
+        writer.writepkt(b'one', ts=1454725786.526401)
+    finally:
+        Writer._Writer__le = _sysle
+    history = fobj.getvalue()
+
+    appender = Writer(fobj, snaplen=1500, linktype=DLT_EN10MB, append=True)
+    appender.writepkt(b'two', ts=1454725787.526401)
+
+    buf = fobj.getvalue()
+    assert buf[:len(history)] == history
+    # the appended EPB is big-endian: type 6, total length 36
+    assert buf[len(history):len(history) + 8] == struct_pack('>II', PCAPNG_BT_EPB, 36)
+
+    fobj.seek(0)
+    assert list(Reader(fobj)) == [
+        (1454725786.526401, b'one'),
+        (1454725787.526401, b'two'),
+    ]
+
+
+def test_append_preserves_unknown_blocks():
+    """Unknown blocks with valid structure are kept, not skipped or deleted"""
+    fobj = BytesIO()
+    writer = Writer(fobj, snaplen=1500)
+    writer.writepkt(b'one', ts=1454725786.526401)
+    buf = fobj.getvalue()
+
+    # splice a minimal unknown block between the IDB and the EPB
+    unknown = struct_pack('<III', 0x0BAD0BAD, 12, 12)
+    fobj = BytesIO(buf[:48] + unknown + buf[48:])
+    history = fobj.getvalue()
+
+    appender = Writer(fobj, snaplen=1500, append=True)
+    appender.writepkt(b'two', ts=1454725787.526401)
+    buf = fobj.getvalue()
+    assert buf[:len(history)] == history
+    assert unknown in buf
+
+    fobj.seek(0)
+    assert list(Reader(fobj)) == [
+        (1454725786.526401, b'one'),
+        (1454725787.526401, b'two'),
+    ]
+
+
+def _truncation_test_file():
+    fobj = BytesIO()
+    writer = Writer(fobj, snaplen=1500)
+    writer.writepkt(b'one', ts=1454725786.526401)
+    writer.writepkt(b'two', ts=1454725787.526401)
+    return fobj.getvalue()
+
+
+def test_append_truncated_tail():
+    """A truncated trailing block is refused by default and dropped on recover"""
+    full = _truncation_test_file()
+    last_epb_offset = len(full) - 36  # EPB hdr (32) + padded pkt (4)
+
+    for cut in (len(full) - 1, len(full) - 6, last_epb_offset + 10, last_epb_offset + 4):
+        truncated = full[:cut]
+
+        # default: refuse to append
+        try:
+            Writer(BytesIO(truncated), append=True)
+            assert False, 'expected UnpackError'
+        except dpkt.UnpackError as e:
+            assert 'truncated block at offset {0}'.format(last_epb_offset) in str(e)
+
+        # recover: drop only the incomplete last block and report its offset
+        fobj = BytesIO(truncated)
+        appender = Writer(fobj, append=True, recover=True)
+        assert appender.truncated_at == last_epb_offset
+        assert len(fobj.getvalue()) == last_epb_offset
+
+        # appending continues cleanly from the truncation point
+        appender.writepkt(b'new', ts=1454725788.526401)
+        buf = fobj.getvalue()
+        assert buf[:last_epb_offset] == full[:last_epb_offset]
+
+        fobj.seek(0)
+        assert list(Reader(fobj)) == [
+            (1454725786.526401, b'one'),
+            (1454725788.526401, b'new'),
+        ]
+
+
+def test_append_mid_file_corruption():
+    """Corruption before the last block is never recoverable"""
+    full = bytearray(_truncation_test_file())
+    first_epb_offset = 48  # SHB (28) + IDB (20)
+
+    # corrupt the trailing length field of the first EPB
+    bad = bytearray(full)
+    bad[first_epb_offset + 32:first_epb_offset + 36] = b'\x00' * 4
+    for recover in (False, True):
+        try:
+            Writer(BytesIO(bytes(bad)), append=True, recover=recover)
+            assert False, 'expected UnpackError'
+        except dpkt.UnpackError as e:
+            assert 'length fields do not match at offset {0}'.format(first_epb_offset) in str(e)
+
+    # corrupt the block length of the first EPB
+    bad = bytearray(full)
+    bad[first_epb_offset + 4:first_epb_offset + 8] = struct_pack('<I', 13)
+    for recover in (False, True):
+        try:
+            Writer(BytesIO(bytes(bad)), append=True, recover=recover)
+            assert False, 'expected UnpackError'
+        except dpkt.UnpackError as e:
+            assert 'invalid block length 13 at offset {0}'.format(first_epb_offset) in str(e)
+
+
+def test_append_requires_seekable_sink():
+    """append mode needs a seekable/readable/writable sink"""
+    class Sink(object):
+        def write(self, buf):
+            return len(buf)
+
+    try:
+        Writer(Sink(), append=True)
+        assert False, 'expected ValueError'
+    except ValueError as e:
+        assert 'seekable' in str(e)
+
+
+def test_append_failed_write_leaves_clean_state():
+    """A failed append rolls the file back and puts the writer in a failed state"""
+    class FlakySink(BytesIO):
+        fail = False
+
+        def write(self, buf):
+            if self.fail:
+                # simulate a partial write followed by an I/O error
+                super(FlakySink, self).write(buf[:len(buf) // 2])
+                raise IOError('disk full')
+            return super(FlakySink, self).write(buf)
+
+    fobj = FlakySink()
+    writer = Writer(fobj, snaplen=1500)
+    writer.writepkt(b'one', ts=1454725786.526401)
+    good_len = len(fobj.getvalue())
+
+    appender = Writer(fobj, snaplen=1500, append=True)
+    fobj.fail = True
+    try:
+        appender.writepkt(b'two', ts=1454725787.526401)
+        assert False, 'expected IOError'
+    except IOError:
+        pass
+
+    # the partial block was rolled back; the writer refuses further writes
+    assert len(fobj.getvalue()) == good_len
+    fobj.fail = False
+    try:
+        appender.writepkt(b'two', ts=1454725787.526401)
+        assert False, 'expected RuntimeError'
+    except RuntimeError:
+        pass
+
+    # the file is still a valid starting point for a new append
+    appender = Writer(fobj, snaplen=1500, append=True)
+    appender.writepkt(b'three', ts=1454725788.526401)
+    fobj.seek(0)
+    assert list(Reader(fobj)) == [
+        (1454725786.526401, b'one'),
+        (1454725788.526401, b'three'),
+    ]
