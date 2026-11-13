@@ -103,6 +103,14 @@ dpkt.dns module
     :undoc-members:
     :show-inheritance:
 
+dpkt.endpoint_rewriter module
+-----------------------------
+
+.. automodule:: dpkt.endpoint_rewriter
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.dpkt module
 ----------------
 

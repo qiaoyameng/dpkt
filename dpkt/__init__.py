@@ -22,6 +22,7 @@ from . import dhcp
 from . import diameter
 from . import dns
 from . import dtp
+from . import endpoint_rewriter
 from . import esp
 from . import ethernet
 from . import gre
